@@ -1,4 +1,1 @@
-flask
-flask-socketio
-gunicorn
-eventlet
+Flask==3.0.2
