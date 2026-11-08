@@ -1,1 +1,4 @@
-Flask==3.0.2
+flask
+flask-socketio
+gunicorn
+eventlet
