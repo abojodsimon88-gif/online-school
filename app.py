@@ -3,13 +3,10 @@ import sqlite3
 import os
 import secrets
 from html import escape
-
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATABASE = os.path.join(BASE_DIR, "school.db")
-
 CLASSES_DICT = {
     "first": "الصف الأول",
     "second": "الصف الثاني",
@@ -60,14 +57,10 @@ DEFAULT_USERS = [
     ("rita", "ريتا", "معلمة", "1234"),
     ("ibtisam", "ابتسام", "معلمة", "1234"),
 ]
-
-
 def get_db():
     conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
     return conn
-
-
 def init_db():
     """Create the users table without deleting existing accounts."""
     with get_db() as conn:
