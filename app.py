@@ -5,6 +5,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from html import escape
+from urllib.parse import urlparse
 
 import pymysql
 from pymysql.cursors import DictCursor
@@ -154,6 +155,25 @@ def run_many(sql, rows):
         conn.close()
 
 
+def replace_teacher_classes(user_key, class_ids):
+    """يستبدل صفوف المعلم دفعة واحدة (حذف + إضافة في عملية واحدة)."""
+    conn = pymysql.connect(**DB_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM teacher_classes WHERE user_key = %s", (user_key,))
+            if class_ids:
+                cur.executemany(
+                    "INSERT INTO teacher_classes (user_key, class_id) VALUES (%s, %s)",
+                    [(user_key, cid) for cid in class_ids],
+                )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -164,6 +184,13 @@ def new_code():
 
 def new_temp_password():
     return "".join(secrets.choice(PW_ALPHABET) for _ in range(10))
+
+
+def ensure_column(table, column, ddl):
+    """يضيف عموداً إلى جدول موجود إذا لم يكن موجوداً (للترقية بدون حذف بيانات)."""
+    row = run("SHOW COLUMNS FROM " + table + " LIKE %s", (column,), fetch="one")
+    if row is None:
+        run("ALTER TABLE " + table + " ADD COLUMN " + column + " " + ddl)
 
 
 def init_db():
@@ -184,7 +211,16 @@ def init_db():
         "class_id VARCHAR(50) NOT NULL PRIMARY KEY,"
         "name VARCHAR(100) NOT NULL,"
         "access_code VARCHAR(20) NOT NULL,"
-        "sort_order INT NOT NULL DEFAULT 0"
+        "sort_order INT NOT NULL DEFAULT 0,"
+        "live_link VARCHAR(500) NOT NULL DEFAULT '',"
+        "live_note VARCHAR(100) NOT NULL DEFAULT ''"
+        ") " + tail
+    )
+    run(
+        "CREATE TABLE IF NOT EXISTS teacher_classes ("
+        "user_key VARCHAR(50) NOT NULL,"
+        "class_id VARCHAR(50) NOT NULL,"
+        "PRIMARY KEY (user_key, class_id)"
         ") " + tail
     )
     run(
@@ -195,6 +231,10 @@ def init_db():
         "INDEX idx_scope_ts (scope, ts)"
         ") " + tail
     )
+
+    # ترقية قاعدة موجودة من النسخة السابقة
+    ensure_column("classes", "live_link", "VARCHAR(500) NOT NULL DEFAULT ''")
+    ensure_column("classes", "live_note", "VARCHAR(100) NOT NULL DEFAULT ''")
 
     # الصفوف: رمز عشوائي لكل صف
     existing = run("SELECT COUNT(*) AS c FROM classes", fetch="one")["c"]
@@ -348,6 +388,46 @@ def admin_required(view):
     return wrapper
 
 
+def can_manage_class(user, class_id):
+    """المدير يدير كل الصفوف، والمعلم يدير الصفوف المعيّنة له فقط."""
+    if user["role_type"] == "admin":
+        return True
+    if user["role_type"] != "teacher":
+        return False
+    row = run(
+        "SELECT 1 AS ok FROM teacher_classes WHERE user_key = %s AND class_id = %s",
+        (user["user_key"], class_id),
+        fetch="one",
+    )
+    return row is not None
+
+
+def clean_link(raw):
+    """يقبل روابط https الكاملة فقط."""
+    link = (raw or "").strip()
+    if not link or len(link) > 500:
+        return None
+    if any(ch.isspace() or ord(ch) < 32 for ch in link):
+        return None
+    parts = urlparse(link)
+    if parts.scheme != "https" or not parts.netloc or "@" in parts.netloc:
+        return None
+    return link
+
+
+# رسائل قصيرة تظهر مرة واحدة بعد التحويل
+def flash_msg(text, ok=True):
+    session["flash"] = ["ok" if ok else "error", text]
+
+
+def pop_flash():
+    data = session.pop("flash", None)
+    if not data:
+        return ""
+    css = "message ok" if data[0] == "ok" else "message error"
+    return '<p class="' + css + '">' + escape(data[1]) + "</p>"
+
+
 # ----------------------------------------------------------------------
 # القالب
 # ----------------------------------------------------------------------
@@ -359,6 +439,8 @@ body { font-family: Arial, sans-serif; background:#f4f6f9; margin:0; padding:20p
 .narrow { max-width:420px; margin:40px auto; }
 input, select { box-sizing:border-box; width:100%; padding:11px; margin:8px 0 16px;
                 border:1px solid #ccc; border-radius:6px; }
+input[type=checkbox] { width:auto; margin:0 0 0 10px; transform:scale(1.3); }
+.check { display:block; padding:8px 0; border-bottom:1px solid #eee; }
 button, .button { display:inline-block; border:0; border-radius:6px; padding:11px 16px;
                   background:#007bff; color:white; text-decoration:none; cursor:pointer;
                   font-size:15px; }
@@ -371,10 +453,13 @@ button, .button { display:inline-block; border:0; border-radius:6px; padding:11p
 .error { background:#fdecea; color:#b00020; }
 .ok { background:#e8f5e9; color:#1b5e20; }
 .hint { color:#666; font-size:14px; }
+.badge { display:inline-block; background:#e8f5e9; color:#1b5e20; border-radius:12px;
+         padding:2px 10px; font-size:13px; margin-bottom:8px; }
 .tablewrap { overflow-x:auto; }
 table { width:100%; border-collapse:collapse; margin:10px 0 20px; }
 th, td { border:1px solid #ddd; padding:8px; text-align:right; font-size:14px; }
-.ltr { direction:ltr; unicode-bidi:plaintext; display:inline-block; font-family:monospace; }
+.ltr { direction:ltr; unicode-bidi:plaintext; display:inline-block; font-family:monospace;
+       word-break:break-all; }
 """
 
 
@@ -500,7 +585,6 @@ def logout():
 def change_password():
     user = current_user()
     message = ""
-    ok = False
 
     if request.method == "POST":
         old_pass = (request.form.get("old_pass") or "")[:MAX_PASSWORD_LEN]
@@ -533,14 +617,13 @@ def change_password():
                 clear_failures(scope)
                 return redirect(url_for("dashboard"))
 
-    msg_html = ""
-    if message:
-        css = "message ok" if ok else "message error"
-        msg_html = '<p class="' + css + '">' + escape(message) + "</p>"
+    msg_html = '<p class="message error">' + escape(message) + "</p>" if message else ""
     forced = ""
     if user["must_change"]:
         forced = '<p class="message">يجب تغيير كلمة المرور المؤقتة قبل المتابعة.</p>'
-    back = "" if user["must_change"] else '<p><a href="' + url_for("dashboard") + '">العودة إلى لوحة التحكم</a></p>'
+    back = ""
+    if not user["must_change"]:
+        back = '<p><a href="' + url_for("dashboard") + '">العودة إلى لوحة التحكم</a></p>'
 
     content = (
         '<section class="panel narrow"><h2>تغيير كلمة المرور</h2>'
@@ -572,13 +655,28 @@ def dashboard():
     user = current_user()
     classes = run("SELECT class_id, name FROM classes ORDER BY sort_order", fetch="all")
 
+    mine = set()
+    if user["role_type"] == "teacher":
+        rows = run(
+            "SELECT class_id FROM teacher_classes WHERE user_key = %s",
+            (user["user_key"],),
+            fetch="all",
+        )
+        mine = {r["class_id"] for r in rows}
+        classes = sorted(classes, key=lambda c: c["class_id"] not in mine)
+
     cards = ""
     for c in classes:
         link = url_for("classroom", class_id=c["class_id"])
+        badge = '<div class="badge">صفّي</div>' if c["class_id"] in mine else ""
         cards += (
-            '<div class="class-card"><h3>' + escape(c["name"]) + "</h3>"
+            '<div class="class-card">' + badge + "<h3>" + escape(c["name"]) + "</h3>"
             '<a class="button success" href="' + link + '">دخول الصف</a></div>'
         )
+
+    note = ""
+    if user["role_type"] == "teacher" and not mine:
+        note = '<p class="message">لم يتم تعيين صفوف لك بعد. اطلب من المدير تعيينها.</p>'
 
     admin_btn = ""
     if user["role_type"] == "admin":
@@ -586,7 +684,8 @@ def dashboard():
 
     content = (
         '<section class="panel">'
-        '<div class="actions" style="justify-content:space-between;background:#007bff;'
+        + pop_flash()
+        + '<div class="actions" style="justify-content:space-between;background:#007bff;'
         'color:white;padding:18px;border-radius:8px;">'
         "<div><h2>مرحباً بك، " + escape(user["name"]) + "</h2>"
         "<p>الصلاحية: <b>" + escape(user["role_label"]) + "</b></p></div>"
@@ -594,7 +693,8 @@ def dashboard():
         + '<a class="button warning" href="' + url_for("change_password") + '">تغيير كلمة المرور</a>'
         + logout_form()
         + "</div></div>"
-        "<h3>قائمة الصفوف الدراسية</h3>"
+        + note
+        + "<h3>قائمة الصفوف الدراسية</h3>"
         '<div class="grid">' + cards + "</div></section>"
     )
     return page(content, "لوحة التحكم - المنصة المدرسية")
@@ -603,7 +703,8 @@ def dashboard():
 @app.route("/classroom/<class_id>", methods=["GET", "POST"])
 def classroom(class_id):
     cls = run(
-        "SELECT class_id, name, access_code FROM classes WHERE class_id = %s",
+        "SELECT class_id, name, access_code, live_link, live_note "
+        "FROM classes WHERE class_id = %s",
         (class_id,),
         fetch="one",
     )
@@ -644,27 +745,90 @@ def classroom(class_id):
         )
         return page(content, cls["name"] + " - دخول")
 
+    # --- الحصة المباشرة (تظهر للطلاب والكادر) ---
+    live_link = cls["live_link"] or ""
+    live_note = cls["live_note"] or ""
+    if live_link:
+        note_html = "<p>" + escape(live_note) + "</p>" if live_note else ""
+        live_html = (
+            '<div class="message ok"><b>الحصة المباشرة</b>' + note_html
+            + '<a class="button success" href="' + escape(live_link, quote=True)
+            + '" target="_blank" rel="noopener noreferrer">انضم للحصة</a></div>'
+        )
+    else:
+        live_html = '<p class="message">لا توجد حصة مباشرة حالياً.</p>'
+
+    extra = ""
+    manage_html = ""
     if user:
         link = request.host_url.rstrip("/") + url_for("classroom", class_id=class_id)
         extra = (
             '<p class="message">رابط الصف: <span class="ltr">' + escape(link) + "</span><br>"
             'رمز الصف: <b class="ltr">' + escape(cls["access_code"]) + "</b></p>"
         )
+        if can_manage_class(user, class_id):
+            action = url_for("set_live_link", class_id=class_id)
+            manage_html = (
+                '<div style="text-align:right"><h3>إدارة رابط الحصة المباشرة</h3>'
+                '<form method="post" action="' + action + '">'
+                + csrf_field()
+                + "<label>وصف الحصة (اختياري، مثال: رياضيات الساعة 10)</label>"
+                '<input type="text" name="live_note" maxlength="100" value="'
+                + escape(live_note, quote=True) + '">'
+                "<label>رابط الحصة (Zoom أو Meet، يبدأ بـ https://)</label>"
+                '<input type="url" name="live_link" maxlength="500" dir="ltr" value="'
+                + escape(live_link, quote=True) + '">'
+                '<div class="actions">'
+                '<button class="success" type="submit" name="action" value="save">حفظ الرابط</button>'
+                '<button class="danger" type="submit" name="action" value="clear" formnovalidate>'
+                "حذف الرابط</button></div></form></div>"
+            )
+        elif user["role_type"] == "teacher":
+            manage_html = (
+                '<p class="hint">لإضافة رابط الحصة لهذا الصف، اطلب من المدير تعيينه لك.</p>'
+            )
         footer = '<a class="button" href="' + url_for("dashboard") + '">العودة إلى لوحة التحكم</a>'
     else:
-        extra = ""
         footer = logout_form()
 
     content = (
         '<section class="panel" style="max-width:700px;margin:auto;text-align:center;">'
-        "<h2>" + escape(cls["name"]) + "</h2>"
-        "<p>أنت الآن داخل صفحة الصف.</p>"
+        + pop_flash()
+        + "<h2>" + escape(cls["name"]) + "</h2>"
+        + live_html
         + extra
-        + '<p class="message">هذه الصفحة حالياً واجهة للصف، ويمكن إضافة المحتوى لاحقاً.</p>'
-        + footer
+        + manage_html
+        + '<div style="margin-top:20px">' + footer + "</div>"
         + "</section>"
     )
     return page(content, cls["name"] + " - الصف")
+
+
+@app.route("/classroom/<class_id>/live", methods=["POST"])
+@staff_required
+def set_live_link(class_id):
+    user = current_user()
+    exists = run("SELECT class_id FROM classes WHERE class_id = %s", (class_id,), fetch="one")
+    if exists is None:
+        abort(404)
+    if not can_manage_class(user, class_id):
+        abort(403)
+
+    if request.form.get("action") == "clear":
+        run("UPDATE classes SET live_link = '', live_note = '' WHERE class_id = %s", (class_id,))
+        flash_msg("تم حذف رابط الحصة.")
+    else:
+        link = clean_link(request.form.get("live_link"))
+        if link is None:
+            flash_msg("الرابط غير صالح. لازم يكون رابطاً كاملاً يبدأ بـ https://", ok=False)
+        else:
+            note = (request.form.get("live_note") or "").strip()[:100]
+            run(
+                "UPDATE classes SET live_link = %s, live_note = %s WHERE class_id = %s",
+                (link, note, class_id),
+            )
+            flash_msg("تم حفظ رابط الحصة. الطلاب سيرونه فوراً.")
+    return redirect(url_for("classroom", class_id=class_id))
 
 
 # ----------------------------------------------------------------------
@@ -687,8 +851,10 @@ def credentials_notice(items):
 
 def render_admin(notice_html=""):
     users = run(
-        "SELECT user_key, name, role_label, must_change, (password_hash = %s) AS pending "
-        "FROM users ORDER BY role_type, name",
+        "SELECT u.user_key, u.name, u.role_label, u.role_type, u.must_change, "
+        "(u.password_hash = %s) AS pending, "
+        "(SELECT COUNT(*) FROM teacher_classes t WHERE t.user_key = u.user_key) AS n_classes "
+        "FROM users u ORDER BY u.role_type, u.name",
         (LOCKED,),
         fetch="all",
     )
@@ -706,13 +872,24 @@ def render_admin(notice_html=""):
         else:
             status = "مفعّل"
         action = url_for("admin_reset", user_key=u["user_key"])
+        if u["role_type"] == "teacher":
+            count_cell = str(u["n_classes"])
+            classes_btn = (
+                '<a class="button" href="' + url_for("admin_teacher", user_key=u["user_key"])
+                + '">الصفوف</a>'
+            )
+        else:
+            count_cell = "-"
+            classes_btn = ""
         user_rows += (
             "<tr><td>" + escape(u["name"]) + "</td><td>" + escape(u["role_label"])
             + '</td><td><span class="ltr">' + escape(u["user_key"]) + "</span></td><td>"
-            + status + "</td><td>"
-            '<form method="post" action="' + action + '" style="margin:0">'
+            + status + "</td><td>" + count_cell + "</td><td>"
+            '<div class="actions">' + classes_btn
+            + '<form method="post" action="' + action + '" style="margin:0">'
             + csrf_field()
-            + '<button class="warning" type="submit">إصدار كلمة مؤقتة</button></form></td></tr>'
+            + '<button class="warning" type="submit">كلمة مؤقتة</button></form>'
+            "</div></td></tr>"
         )
 
     class_rows = ""
@@ -733,13 +910,14 @@ def render_admin(notice_html=""):
         '<section class="panel"><div class="actions" style="justify-content:space-between">'
         "<h2>إدارة الحسابات والصفوف</h2>"
         '<a class="button" href="' + url_for("dashboard") + '">العودة</a></div>'
+        + pop_flash()
         + notice_html
         + "<h3>الحسابات</h3>"
         '<form method="post" action="' + pending_action + '">'
         + csrf_field()
         + '<button class="success" type="submit">تفعيل كل الحسابات التي بانتظار التفعيل</button></form>'
         '<div class="tablewrap"><table><tr><th>الاسم</th><th>الدور</th><th>اسم المستخدم</th>'
-        "<th>الحالة</th><th></th></tr>" + user_rows + "</table></div>"
+        "<th>الحالة</th><th>عدد الصفوف</th><th></th></tr>" + user_rows + "</table></div>"
         "<h3>الصفوف ورموز الدخول</h3>"
         '<form method="post" action="' + codes_action + '">'
         + csrf_field()
@@ -756,6 +934,52 @@ def render_admin(notice_html=""):
 @admin_required
 def admin_panel():
     return render_admin()
+
+
+@app.route("/admin/teacher/<user_key>", methods=["GET", "POST"])
+@admin_required
+def admin_teacher(user_key):
+    teacher = run(
+        "SELECT user_key, name, role_type FROM users WHERE user_key = %s",
+        (user_key,),
+        fetch="one",
+    )
+    if teacher is None or teacher["role_type"] != "teacher":
+        abort(404)
+
+    classes = run("SELECT class_id, name FROM classes ORDER BY sort_order", fetch="all")
+    valid_ids = {c["class_id"] for c in classes}
+
+    if request.method == "POST":
+        chosen = [cid for cid in request.form.getlist("classes") if cid in valid_ids]
+        replace_teacher_classes(user_key, chosen)
+        flash_msg("تم حفظ صفوف " + teacher["name"] + " (" + str(len(chosen)) + ").")
+        return redirect(url_for("admin_panel"))
+
+    rows = run(
+        "SELECT class_id FROM teacher_classes WHERE user_key = %s", (user_key,), fetch="all"
+    )
+    current = {r["class_id"] for r in rows}
+
+    boxes = ""
+    for c in classes:
+        checked = " checked" if c["class_id"] in current else ""
+        boxes += (
+            '<label class="check"><input type="checkbox" name="classes" value="'
+            + escape(c["class_id"], quote=True) + '"' + checked + ">"
+            + escape(c["name"]) + "</label>"
+        )
+
+    content = (
+        '<section class="panel narrow"><h2>صفوف ' + escape(teacher["name"]) + "</h2>"
+        '<p class="hint">المعلم بيقدر يضيف رابط الحصة المباشرة للصفوف المعلّمة هون فقط.</p>'
+        '<form method="post">' + csrf_field() + boxes
+        + '<div class="actions" style="margin-top:16px">'
+        '<button class="success" type="submit">حفظ</button>'
+        '<a class="button" style="background:#6c757d" href="' + url_for("admin_panel")
+        + '">رجوع</a></div></form></section>'
+    )
+    return page(content, "صفوف المعلم - المنصة المدرسية")
 
 
 @app.route("/admin/reset/<user_key>", methods=["POST"])
@@ -795,11 +1019,10 @@ def admin_reset_pending():
 @app.route("/admin/class_code/<class_id>", methods=["POST"])
 @admin_required
 def admin_class_code(class_id):
-    changed = run(
-        "UPDATE classes SET access_code = %s WHERE class_id = %s", (new_code(), class_id)
-    )
-    if not changed:
+    exists = run("SELECT class_id FROM classes WHERE class_id = %s", (class_id,), fetch="one")
+    if exists is None:
         abort(404)
+    run("UPDATE classes SET access_code = %s WHERE class_id = %s", (new_code(), class_id))
     return redirect(url_for("admin_panel"))
 
 
